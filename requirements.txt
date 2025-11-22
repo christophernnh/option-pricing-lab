@@ -1,0 +1,30 @@
+# Core Math & Data
+numpy
+pandas
+
+# Plotting & Visualization
+matplotlib
+seaborn            # for heatmaps
+
+# Streamlit UI
+streamlit
+
+# Finance Data Loader
+yfinance
+requests
+
+# Option Pricing & Numerical Tools
+scipy              # optimization (Newton, Brent) + stats
+numba              # accelerate BSM & Heston loops
+py_vollib          # (optional) BSM & implied vol helpers
+
+# Heston Calibration / Advanced Models
+quantlib           # heavy but industry standard (optional)
+arch               # GARCH models for vol forecasting
+
+# Data Validation / Model Classes
+pydantic           # if you want stricter model definitions
+
+# Development Tools
+pytest             # tests
+black              # formatting
