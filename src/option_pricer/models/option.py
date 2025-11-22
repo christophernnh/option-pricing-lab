@@ -83,10 +83,10 @@ class OptionChain:
     """
     Represents a full option chain (all expiries, all strikes).
     """
-    underlying: str
-    as_of: str
-    spot: Optional[float] = None
-    contracts: List[OptionContract] = field(default_factory=list)
+    underlying: str         # underlying asset ticker (e.g. "AAPL")
+    as_of: str              # date for which the chain snapshot is taken (e.g. "YYYY-MM-DD")
+    spot: Optional[float] = None    # spot price of the underlying asset when the snapshot was taken
+    contracts: List[OptionContract] = field(default_factory=list) # List of all OptionContracts in the chain
 
     # -------------------------------------------------
     def enrich(self):
@@ -101,7 +101,7 @@ class OptionChain:
     # -------------------------------------------------
     def by_expiry(self) -> Dict[str, List[OptionContract]]:
         """
-        Groups contracts by expiry date.
+        Groups contracts sorted by expiry date.
         """
         out: Dict[str, List[OptionContract]] = {}
         for c in self.contracts:
@@ -112,18 +112,42 @@ class OptionChain:
     def filter_liquid(
         self,
         min_oi: int = 10,
-        min_volume: int = 1
+        min_volume: int = 1,
+        max_spread_pct: float = 0.25,   # 25% spread allowed
+        ignore_stale_last: bool = True
     ) -> "OptionChain":
         """
         Returns a new OptionChain containing only contracts
-        with reasonable liquidity.
+        with realistic liquidity and price quality.
         """
+
         filtered = []
+
         for c in self.contracts:
-            oi = c.open_interest if c.open_interest is not None else 0
-            vol = c.volume if c.volume is not None else 0
-            if oi >= min_oi and vol >= min_volume:
-                filtered.append(c)
+            oi = c.open_interest or 0
+            vol = c.volume or 0
+
+            # 1) Minimum open interest
+            if oi < min_oi:
+                continue
+
+            # 2) Minimum daily volume
+            if vol < min_volume:
+                continue
+
+            # 3) Maximum bid–ask spread % (only if we have both)
+            if c.bid is not None and c.ask is not None and c.bid > 0:
+                spread_pct = (c.ask - c.bid) / c.bid
+                if spread_pct > max_spread_pct:
+                    continue
+
+            # 4) Ignore stale last prices (if bid/ask is missing)
+            if ignore_stale_last:
+                if c.bid is None or c.ask is None:
+                    # last price may be hours old → discard
+                    continue
+
+            filtered.append(c)
 
         return OptionChain(
             underlying=self.underlying,
@@ -131,6 +155,7 @@ class OptionChain:
             spot=self.spot,
             contracts=filtered,
         )
+
 
     # -------------------------------------------------
     def to_dataframe(self) -> pd.DataFrame:
