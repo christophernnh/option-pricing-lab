@@ -42,7 +42,6 @@ class LoaderConfig:
     retries: int = 3
     backoff_factor: float = 0.8        # exponential backoff multiplier (seconds)
 
-
 class MarketDataLoader:
     """
     Robust market data loader for option chains using yfinance.
