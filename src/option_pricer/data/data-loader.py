@@ -1,97 +1,186 @@
+# market_data_loader.py
+"""
+MarketDataLoader for option chains.
+
+Features:
+- Threaded expiry downloads (configurable max_workers)
+- Retry + exponential backoff for flaky network calls
+- Optional non-destructive liquidity tagging (is_liquid flag)
+- Configurable liquidity filters (min OI, min volume, max spread pct, stale-last policy)
+- Attaches spot to OptionChain and computes derived fields
+- Clear extension point for computing implied vol / vega (placeholder)
+- Streamlit cache decorator (commented) ready
+"""
+
+from __future__ import annotations
+
 import logging
+import time
 from concurrent.futures import ThreadPoolExecutor, as_completed
+from dataclasses import dataclass
 from datetime import datetime
-from typing import List, Optional
+from typing import List, Optional, Dict, Any, Tuple, Callable
 
 import yfinance as yf
 
+from option_pricer.models.option import OptionContract, OptionChain
 
-# adjust the imports to match your package structure
-from option_pricer.models.option import OptionContract
-from option_pricer.models.option import OptionChain
-
-
+"""Set up logging."""
 logger = logging.getLogger(__name__)
 logging.basicConfig(level=logging.INFO)
 
 
+@dataclass
+class LoaderConfig:
+    """Configuration for MarketDataLoader behavior."""
+    min_open_interest: int = 10
+    min_volume: int = 1
+    max_spread_pct: float = 0.25       # e.g., (ask - bid) / bid <= 0.25
+    ignore_stale_last: bool = True     # if True, require bid & ask to compute mid; otherwise allow last
+    
+    max_workers: int = 8
+    retries: int = 3
+    backoff_factor: float = 0.8        # exponential backoff multiplier (seconds)
+
+
 class MarketDataLoader:
-    def __init__(self, min_open_interest: int = 0, min_volume: int = 0, max_workers: int = 8):
+    """
+    Robust market data loader for option chains using yfinance.
+    Usage:
+        cfg = LoaderConfig(...)
+        loader = MarketDataLoader(cfg)
+        chain = loader.get_option_chain("AAPL", filter=True, tag_liquidity=False)
+    """
+
+    def __init__(self, config: Optional[LoaderConfig] = None):
+        self.config = config or LoaderConfig()
+
+    # To cache results if function is ran using the same input:
+    # @st.cache_data(ttl=60*10)
+    def get_option_chain(self, ticker: str, filter: bool = True, tag_liquidity: bool = False) -> OptionChain:
         """
-        :param min_open_interest: minimal open interest for a contract to be considered 'liquid'
-        :param min_volume: minimal volume for a contract to be considered 'liquid'
-        :param max_workers: number of threads to use when loading expiries in parallel
+        Download the option chain for `ticker` and return an OptionChain.
+
+        :param ticker: ticker symbol, e.g. "AAPL"
+        :param filter: if True, apply liquidity filters (destructive: removes illiquid contracts)
+        :param tag_liquidity: if True, keep all contracts but set attribute `is_liquid` on contracts
+                               NOTE: if both filter=True and tag_liquidity=True, filtering is applied
+                               and tagging is performed on the filtered results.
         """
-        self.min_open_interest = int(min_open_interest or 0)
-        self.min_volume = int(min_volume or 0)
-        self.max_workers = max_workers
+        tk = yf.Ticker(ticker)                                 # yfinance Ticker object
+        as_of_date = datetime.utcnow().date().isoformat()      # record current snapshot date
 
-    # If using Streamlit, you can enable caching here:
-    # @st.cache_data(ttl=60*10)  # cache for 10 minutes (example)
-    def get_option_chain(self, ticker: str) -> OptionChain:
-        """Public entry: download option chain for `ticker` and return an enriched OptionChain."""
-        tk = yf.Ticker(ticker)
-        as_of_date = datetime.utcnow().date().isoformat()
+        expiries: List[str] = list(getattr(tk, "options", []) or [])        # list of expiry dates
+        logger.info("Ticker %s: found %d expiries", ticker, len(expiries))  # log expiry count
 
-        # fetch expiries; fallback to empty list
-        expiries: List[str] = list(getattr(tk, "options", []) or [])
-        logger.info("Ticker %s has %d expiries", ticker, len(expiries))
-
-        # fetch spot price safely
-        spot = self._safe_get_spot(tk)
+        spot = self._safe_get_spot_with_retry(tk)                     # attempt to get spot price with retries
         if spot is None:
-            logger.warning("Failed to fetch spot price for %s; some fields (moneyness) may be None", ticker)
+            logger.warning("Ticker %s: could not retrieve spot price; moneyness will be None", ticker)
 
-        # Concurrently load expiry chains
         contracts: List[OptionContract] = []
         if expiries:
-            with ThreadPoolExecutor(max_workers=self.max_workers) as ex:
-                futures = {ex.submit(self._load_single_expiry, tk, expiry, spot): expiry for expiry in expiries}
-                for fut in as_completed(futures):
-                    expiry = futures[fut]
+            # Use multithreading to load each expiry in parallel
+            with ThreadPoolExecutor(max_workers=self.config.max_workers) as ex:
+                future_to_expiry = {}   # Creates a dictionary with type: Dict[Any, str]  
+                # Loop through all expiry load tasks
+                for expiry in expiries:
+                    future = ex.submit(self._load_single_expiry_with_retry, tk, expiry, spot) # Fetch call and put prices concurrently
+                    future_to_expiry[future] = expiry                                         # Map future to expiry date
+
+                # Wait for all futures to complete using as_completed
+                for fut in as_completed(future_to_expiry):
+                    expiry = future_to_expiry[fut]          # Get the expiry date for this future
                     try:
-                        loaded = fut.result()
-                        contracts.extend(loaded)
-                        logger.info("Loaded %d contracts for expiry %s", len(loaded), expiry)
+                        loaded = fut.result()               # Get the call and put result from yfinance
+                        contracts.extend(loaded)            # Insert loaded contract list into a bigger list (2D list)
+                        logger.info("Ticker %s: loaded %d contracts for expiry %s", ticker, len(loaded), expiry)
                     except Exception as e:
-                        logger.exception("Failed to load expiry %s: %s", expiry, e)
+                        logger.exception("Ticker %s: failed loading expiry %s: %s", ticker, expiry, e)
 
-        # build OptionChain and apply filters
-        chain_obj = OptionChain(underlying=ticker, as_of=as_of_date, contracts=sorted(contracts, key=lambda c: (c.expiry, c.strike, c.option_type)))
-        chain_obj.spot = spot  # attach spot for downstream use
-        if self.min_open_interest or self.min_volume:
-            chain_obj = chain_obj.filter_liquid(self.min_open_interest, self.min_volume)
-            logger.info("After filtering, %d contracts remain", len(chain_obj.contracts))
+        # Sort contracts for deterministic ordering
+        contracts = sorted(contracts, key=lambda c: (c.expiry, c.strike, c.option_type))
 
-        return chain_obj
+        chain = OptionChain(underlying=ticker, as_of=as_of_date, spot=spot, contracts=contracts)
 
-    def _load_single_expiry(self, tk: yf.Ticker, expiry: str, spot: Optional[float]) -> List[OptionContract]:
-        """
-        Load one expiry's calls and puts, convert rows to OptionContract objects,
-        and annotate derived fields.
-        """
+        # Calculate derived fields (mid, moneyness, maturity)
+        chain.enrich()
+
+        # Tag liquidity (non-destructive) if requested
+        if tag_liquidity:
+            self._tag_liquidity(chain)
+
+        # Filter (destructive) if requested
+        if filter:
+            chain = self._filter_chain(chain)
+
+        logger.info("Ticker %s: returning chain with %d contracts", ticker, len(chain.contracts))
+        return chain
+
+    # ---------------------------
+    # Retry & network helpers
+    # ---------------------------
+    def _retry_loop(self, func: Callable[..., Any], *args, **kwargs) -> Any:
+        """Simple retry loop with exponential backoff."""
+        retries = max(0, int(self.config.retries))
+        backoff = float(self.config.backoff_factor) or 0.5
+        last_exc = None
+        for attempt in range(retries + 1):
+            try:
+                return func(*args, **kwargs)
+            except Exception as e:
+                last_exc = e
+                wait = backoff * (2 ** attempt)
+                logger.debug("Attempt %d failed with %s — retrying in %.2fs", attempt + 1, e, wait)
+                time.sleep(wait)
+        # All retries failed
+        logger.exception("All %d retries failed for function %s", retries, getattr(func, "__name__", str(func)))
+        raise last_exc
+
+    def _safe_get_spot_with_retry(self, tk: yf.Ticker) -> Optional[float]:
+        """Wrapper around _safe_get_spot using retry logic."""
         try:
-            chain = tk.option_chain(expiry)
+            return self._retry_loop(self._safe_get_spot, tk)
+        except Exception:
+            return None
+
+    def _load_single_expiry_with_retry(self, tk: yf.Ticker, expiry: str, spot: Optional[float]) -> List[OptionContract]:
+        """Load one expiry with retry logic around yf.option_chain."""
+        return self._retry_loop(self._load_single_expiry, tk, expiry, spot)
+
+    # ---------------------------
+    # Core loading
+    # ---------------------------
+    def _load_single_expiry(self, tk: yf.Ticker, expiry: str, spot: Optional[float]) -> List[OptionContract]:
+        """Load one expiry's option chain and convert to OptionContract list."""
+        try:
+            df_chain = tk.option_chain(expiry)
         except Exception as e:
             logger.exception("yf.option_chain failed for expiry %s: %s", expiry, e)
             return []
 
-        contracts: List[OptionContract] = []
-        # reuse helper for calls and puts
-        contracts.extend(self._build_contracts(chain.calls, 'C', tk.ticker, expiry, spot))
-        contracts.extend(self._build_contracts(chain.puts, 'P', tk.ticker, expiry, spot))
-        return contracts
+        result: List[OptionContract] = []
+        # Calls and puts - keep code DRY by delegating to _build_contracts
+        result.extend(self._build_contracts(df_chain.calls, "C", tk.ticker, expiry, spot))
+        result.extend(self._build_contracts(df_chain.puts, "P", tk.ticker, expiry, spot))
+        return result
 
     def _build_contracts(self, df, opt_type: str, underlying: str, expiry: str, spot: Optional[float]) -> List[OptionContract]:
-        """Convert a DataFrame of options (calls or puts) into OptionContract objects."""
-        result: List[OptionContract] = []
+        """
+        Convert yfinance DataFrame (calls or puts) to OptionContract objects.
+        This method is resilient to schema differences across yfinance versions.
+        """
+        out: List[OptionContract] = []
         for row in df.itertuples(index=False):
-            # safe extraction with getattr fallback to keep compatibility across yfinance versions
+            # Extract symbol and strike robustly
             try:
                 symbol = getattr(row, "contractSymbol", None) or getattr(row, "symbol", None)
-                strike = float(getattr(row, "strike"))
+                strike_raw = getattr(row, "strike", None)
+                if strike_raw is None:
+                    logger.debug("Skipping row with missing strike: %r", row)
+                    continue
+                strike = float(strike_raw)
             except Exception:
-                logger.debug("Skipping row due to missing symbol/strike: %r", row)
+                logger.debug("Skipping invalid row: %r", row)
                 continue
 
             bid = self._to_float(getattr(row, "bid", None))
@@ -113,17 +202,26 @@ class MarketDataLoader:
                 open_interest=open_interest,
             )
 
-            # derived fields
+            # Derived fields that don't require heavy computation
             c.compute_mid()
             self._annotate_maturity(c, spot)
-            # placeholder: you can compute implied_vol and vega here if you want
-            # e.g. c.implied_vol = compute_implied_vol(c.market_price, spot, ...)
-            result.append(c)
-        return result
 
+            # Placeholder: compute implied vol & vega if you have a BSM pricer available
+            # try:
+            #     if c.market_price is not None and c.maturity_years and c.maturity_years > 0 and spot:
+            #         c.implied_vol = compute_implied_vol(c.market_price, spot, c.strike, c.maturity_years, ...)
+            #         c.vega = compute_vega(spot, c.strike, c.maturity_years, c.implied_vol, ...)
+            # except Exception:
+            #     logger.debug("IV compute failed for %s", c.symbol)
+
+            out.append(c)
+        return out
+
+    # ---------------------------
+    # Conversion helpers
+    # ---------------------------
     @staticmethod
-    def _to_float(v) -> Optional[float]:
-        """Safely convert value to float; treat negative or missing as None."""
+    def _to_float(v: Any) -> Optional[float]:
         try:
             if v is None:
                 return None
@@ -135,8 +233,7 @@ class MarketDataLoader:
             return None
 
     @staticmethod
-    def _to_int(v) -> Optional[int]:
-        """Safely convert value to int; treat negative or missing as None."""
+    def _to_int(v: Any) -> Optional[int]:
         try:
             if v is None:
                 return None
@@ -147,17 +244,16 @@ class MarketDataLoader:
         except Exception:
             return None
 
+    # ---------------------------
+    # Spot / maturity helpers
+    # ---------------------------
     @staticmethod
     def _safe_get_spot(tk: yf.Ticker) -> Optional[float]:
-        """Get latest close price from tk.history, return None on failure."""
-        try:
-            hist = tk.history(period="1d")
-            if hist is None or hist.empty:
-                return None
-            return float(hist["Close"].iloc[-1])
-        except Exception:
-            logger.exception("Failed to fetch history/spot for ticker %s", getattr(tk, "ticker", "unknown"))
-            return None
+        """Get latest close price from tk.history, return None on failure (no retries)."""
+        hist = tk.history(period="1d")
+        if hist is None or hist.empty:
+            raise ValueError("Empty history")
+        return float(hist["Close"].iloc[-1])
 
     @staticmethod
     def _annotate_maturity(contract: OptionContract, spot: Optional[float]) -> None:
@@ -175,3 +271,38 @@ class MarketDataLoader:
             contract.maturity_years = days / 365.0 if days > 0 else 0.0
         except Exception:
             contract.maturity_years = None
+
+    # ---------------------------
+    # Liquidity tagging & filtering
+    # ---------------------------
+    def _is_liquid(self, c: OptionContract) -> bool:
+        """Return True if contract meets liquidity criteria defined in config."""
+        oi = c.open_interest or 0
+        vol = c.volume or 0
+        if oi < self.config.min_open_interest or vol < self.config.min_volume:
+            return False
+
+        # spread percentage check
+        if c.bid is not None and c.ask is not None and c.bid > 0:
+            spread_pct = (c.ask - c.bid) / c.bid
+            if spread_pct > self.config.max_spread_pct:
+                return False
+
+        # If we require bid/ask to be present (ignore stale last), enforce it
+        if self.config.ignore_stale_last and (c.bid is None or c.ask is None):
+            return False
+
+        return True
+
+    def _tag_liquidity(self, chain: OptionChain) -> None:
+        """
+        Non-destructively tag contracts with attribute `is_liquid` (True/False).
+        This leaves the original chain intact but adds metadata useful for UI.
+        """
+        for c in chain.contracts:
+            setattr(c, "is_liquid", self._is_liquid(c))
+
+    def _filter_chain(self, chain: OptionChain) -> OptionChain:
+        """Return a new OptionChain with only liquid contracts (destructive)."""
+        filtered = [c for c in chain.contracts if self._is_liquid(c)]
+        return OptionChain(underlying=chain.underlying, as_of=chain.as_of, spot=chain.spot, contracts=filtered)
