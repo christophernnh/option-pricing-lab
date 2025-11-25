@@ -23,7 +23,7 @@ from typing import List, Optional, Dict, Any, Tuple, Callable
 
 import yfinance as yf
 
-from option_pricer.models.option import OptionContract, OptionChain
+from src.option_pricer.models.option import OptionContract, OptionChain
 
 """Set up logging."""
 logger = logging.getLogger(__name__)
@@ -36,7 +36,7 @@ class LoaderConfig:
     min_open_interest: int = 10
     min_volume: int = 1
     max_spread_pct: float = 0.25       # e.g., (ask - bid) / bid <= 0.25
-    ignore_stale_last: bool = True     # if True, require bid & ask to compute mid; otherwise allow last
+    ignore_stale_last: bool = False     # if True, require bid & ask to compute mid; otherwise allow last
     
     max_workers: int = 8
     retries: int = 3
@@ -287,8 +287,8 @@ class MarketDataLoader:
             if spread_pct > self.config.max_spread_pct:
                 return False
 
-        # If we require bid/ask to be present (ignore stale last), enforce it
-        if self.config.ignore_stale_last and (c.bid is None or c.ask is None):
+        # If mid is none, enforce it
+        if c.mid is None:
             return False
 
         return True

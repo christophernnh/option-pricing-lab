@@ -1,6 +1,6 @@
 # pricers/black_scholes.py
 """
-Black–Scholes pricing and Greeks.
+Black-Scholes pricing and Greeks.
 
 Functions:
 - black_scholes_price(S, K, r, q, sigma, tau, option_type)
@@ -51,7 +51,7 @@ def black_scholes_price(
     option_type: OptionType,
 ) -> float:
     """
-    Compute Black–Scholes (European) option price.
+    Compute Black-Scholes (European) option price.
 
     Parameters
     ----------
